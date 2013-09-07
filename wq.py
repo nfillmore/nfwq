@@ -27,10 +27,15 @@ THIRDGET                   = work_queue.WORK_QUEUE_THIRDGET
 THIRDPUT                   = work_queue.WORK_QUEUE_THIRDPUT
 WAITFORTASK                = work_queue.WORK_QUEUE_WAITFORTASK
 
-File      = namedtuple("File",      ("local_name", "remote_name", "type", "flags"))
-Directory = namedtuple("Directory", ("local_name", "remote_name", "type", "flags", "recursive"))
-Buffer    = namedtuple("Buffer",    ("buffer",     "remote_name",         "flags"))
-Job       = namedtuple("Job",       ("id", "cmd", "algorithm", "preferred_host", "cores", "memory", "disk", "parents", "files", "directories", "buffers"))
+#File      = namedtuple("File",      ("local_name", "remote_name", "type", "flags"))
+#Directory = namedtuple("Directory", ("local_name", "remote_name", "type", "flags", "recursive"))
+#Buffer    = namedtuple("Buffer",    ("buffer",     "remote_name",         "flags"))
+Job       = namedtuple("Job",       ("job_id", "tag", "cmd", "algorithm", "preferred_host", "cores", "memory", "disk", "parents", "files", "directories", "buffers"))
+
+def _fetch_exactly_one(cursor):
+  res = cursor.fetchall()
+  assert len(res) == 1
+  return res[0]
 
 class Dag:
 
@@ -41,16 +46,30 @@ class Dag:
   def init(self):
     with self.conn:
 
-      # Tables that describe the job itself.
-      self.conn.execute("create table jobs        (id text primary key, cmd text, algorithm integer, preferred_host text, cores integer, memory integer, disk integer)")
-      self.conn.execute("create table parents     (job_id text, parent_id text)")
-      self.conn.execute("create table files       (job_id text, local_name text, remote_name text, type integer, flags integer)")
-      self.conn.execute("create table directories (job_id text, local_name text, remote_name text, type integer, flags integer, recursive integer)")
-      self.conn.execute("create table buffers     (job_id text, buffer blob,     remote_name text,               flags integer)")
+      # This table describes the job itself.
+      self.conn.execute("""create table jobs (
+        job_id          integer primary key autoincrement,
+        tag             text,
+        cmd             text,
+        algorithm       integer,
+        preferred_host  text,
+        cores           integer,
+        memory          integer,
+        disk            integer,
+        files           text,
+        directories     text,
+        buffers         text)
+        """)
+      self.conn.execute("create index jobs_id on jobs (job_id)")
 
-      # Tables that describe the status changes of the job.
+      # This table describes the DAG.
+      self.conn.execute("create table parents (job_id integer, parent_id integer)")
+      self.conn.execute("create index parents_job_id    on parents (job_id)")
+      self.conn.execute("create index parents_parent_id on parents (parent_id)")
+
+      # This table describes the status changes of the job.
       self.conn.execute("""create table states (
-        job_id                       text,      -- These first four columns
+        job_id                       integer,   -- These first four columns
         state                        text,      -- relate to the state itself.
         is_most_recent               integer,
         timestamp                    timestamp,
@@ -76,47 +95,47 @@ class Dag:
         task_total_transfer_time     integer,
         task_cmd_execution_time      integer)
         """)
-
-      # Tables that control the pipeline.
-      self.conn.execute("create table refresh (request_refresh integer)")
-
-      # Create indices.
       self.conn.execute("create index states_job_id on states (job_id, is_most_recent)")
       self.conn.execute("create index states_state on states (state, is_most_recent)")
-      self.conn.execute("create index parents_job_id on parents (job_id)")
-      self.conn.execute("create index parents_parent_id on parents (parent_id)")
-      self.conn.execute("create index jobs_id on jobs (id)")
-      self.conn.execute("create index files_job_id on files (job_id)")
-      self.conn.execute("create index directories_job_id on directories (job_id)")
-      self.conn.execute("create index buffers_job_id on buffers (job_id)")
 
-  def add(self, cmd, id, parents=None, algorithm=None, preferred_host=None, files=None, directories=None, buffers=None, cores=None, memory=None, disk=None):
-    with self.conn as c:
+      # This table controls the pipeline.
+      self.conn.execute("create table refresh (request_refresh integer)")
 
-      c.execute("insert into jobs values (?, ?, ?, ?, ?, ?, ?)", (id, json.dumps(cmd), algorithm, preferred_host, cores, memory, disk))
+  def add(self, cmd, tag, parents=None, algorithm=None, preferred_host=None, files=None, directories=None, buffers=None, cores=None, memory=None, disk=None):
+    print("Adding {}".format(tag))
+    with self.conn:
 
+      # Add info about the job itself.
+      if files       is None: files       = []
+      if directories is None: directories = []
+      if buffers     is None: buffers     = []
+      files       = json.dumps(files)
+      directories = json.dumps(directories)
+      buffers     = json.dumps(buffers)
+      c = self.conn.execute("""
+        insert into jobs (tag, cmd, algorithm, preferred_host, cores, memory, disk, files, directories, buffers)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (tag, json.dumps(cmd), algorithm, preferred_host, cores, memory, disk, files, directories, buffers))
+      job_id = c.lastrowid
+
+      # Add info about the job's dependencies.
       if parents is not None:
-        for parent in parents:
-          c.execute("insert into parents values (?, ?)", (id, parent))
+        self.conn.executemany(
+        """
+          insert into parents
+          select ? as job_id,
+                 job_id as parent_id
+          from jobs
+          where tag=?
+        """, [[job_id, parent] for parent in parents])
 
-      if files is not None:
-        for file in files:
-          c.execute("insert into files values (?, ?, ?, ?, ?)", (id, file.local_name, file.remote_name, file.type, file.flags))
-
-      if directories is not None:
-        for dir in directories:
-          c.execute("insert into directories values (?, ?, ?, ?, ?, ?)", (id, dir.local_name, dir.remote_name, dir.type, dir.flags, dir.recursive))
-
-      if buffers is not None:
-        for buf in buffers:
-          c.execute("insert into buffers values (?, ?, ?, ?)", (id, buf.buffer, buf.remote_name, buf.flags))
-
-      c.execute("insert into states (job_id, state, is_most_recent, timestamp) values (?, \"waiting\", 1, ?)", (id, datetime.datetime.now()))
+      # Init the state of the job to "waiting".
+      c.execute("insert into states (job_id, state, is_most_recent, timestamp) values (?, \"waiting\", 1, ?)", (job_id, datetime.datetime.now()))
 
   def get_state(self, job_id):
     c = self.conn.cursor()
     c.execute("select state from states where job_id=? and is_most_recent=1", (job_id,))
-    return c.fetchone()["state"]
+    return _fetch_exactly_one(c)["state"]
 
   def update_state(self, job_id, state, task=None):
     with self.conn as c:
@@ -176,7 +195,7 @@ class Dag:
   def find_ready_jobs(self):
     ready_job_ids = []
     c = self.conn.cursor()
-    #c.execute("select distinct id from jobs")
+    #c.execute("select distinct job_id from jobs")
     #return [job_id for (job_id,) in c if self.get_state(job_id) == "waiting" and self.is_job_ready(job_id)]
     c.execute("select job_id from states where state=\"waiting\" and is_most_recent=1")
     job_ids = [r["job_id"] for r in c]
@@ -205,22 +224,14 @@ class Dag:
   def get_job_info(self, job_id):
     c = self.conn.cursor()
 
-    c.execute("select id, cmd, algorithm, preferred_host, cores, memory, disk from jobs where id=?", (job_id,))
-    rows = c.fetchall()
-    assert len(rows) == 1
-    info = dict(rows[0])
+    c.execute("select * from jobs where job_id=?", (job_id,))
+    info = dict(_fetch_exactly_one(c))
+    info["files"]       = json.loads(info["files"])
+    info["directories"] = json.loads(info["directories"])
+    info["buffers"]     = json.loads(info["buffers"])
 
     c.execute("select parent_id from parents where job_id=?", (job_id,))
     info["parents"] = tuple(r["parent_id"] for r in c)
-
-    c.execute("select local_name, remote_name, type, flags from files where job_id=?", (job_id,))
-    info["files"] = tuple(File(**r) for r in c)
-
-    c.execute("select local_name, remote_name, type, flags, recursive from directories where job_id=?", (job_id,))
-    info["directories"] = tuple(Directory(**r) for r in c)
-
-    c.execute("select buffer, remote_name, flags from buffers where job_id=?", (job_id,))
-    info["buffers"] = tuple(Buffer(**r) for r in c)
 
     return Job(**info)
 
@@ -230,13 +241,18 @@ class Dag:
     c.execute("select count(*) as count from refresh")
     should_refresh = (c.fetchone()["count"] != 0)
     if should_refresh:
-      with self.conn as c:
-        c.execute("delete from refresh")
+      with self.conn:
+        self.conn.execute("delete from refresh")
     return should_refresh
 
   def request_refresh(self):
-    with self.conn as c:
-      c.execute("insert into refresh values (1)")
+    with self.conn:
+      self.conn.execute("insert into refresh values (1)")
+
+  def tag_to_job_id(self, tag):
+    c = self.conn.cursor()
+    c.execute("select job_id from jobs where tag=?", (tag,))
+    return _fetch_exactly_one(c)["job_id"]
 
 class Master:
 
@@ -250,8 +266,8 @@ class Master:
     # new jobs.
     while True:
       task = self.wq.wait(0)
-      print(task)
       if task:
+        print("Finished {}".format(task.tag))
         job_id = self.postprocess_popped_task(task)
         self.queue_ready_children(job_id)
       self.print_status()
@@ -269,7 +285,7 @@ class Master:
   def postprocess_popped_task(self, task):
     """Check whether the task succeeded, and update the database as appropriate.
     "Success" means that the task succeeded and its subprocess returned 0."""
-    job_id = task.tag
+    job_id = self.dag.tag_to_job_id(task.tag)
     if task.result == 0 and task.return_status == 0:
       self.dag.update_state(job_id, "finished", task)
     else:
@@ -282,19 +298,19 @@ class Master:
       self.queue(job_id)
 
   def queue_ready_jobs(self):
-    print("Looking for ready jobs...")
+    print("Looking for ready jobs ...")
     job_ids = self.dag.find_ready_jobs()
-    print("Found ready jobs: {}".format(job_ids))
+    print("... Found ready jobs: {}".format(job_ids))
     for job_id in job_ids:
-      print("Queueing {}".format(job_id))
       self.queue(job_id)
 
   def queue(self, job_id):
     job = self.dag.get_job_info(job_id)
+    print("Queuing {}".format(job.tag))
 
     wq_py = os.path.abspath(__file__)
     t = work_queue.Task("{} _drive".format(wq_py))
-    t.specify_tag(job_id)
+    t.specify_tag(job.tag)
     t.specify_buffer(buffer=job.cmd, remote_name="__cmd__", flags=NOCACHE)
 
     if job.algorithm      is not None: t.specify_algorithm     (job.algorithm)
@@ -303,12 +319,11 @@ class Master:
     if job.memory         is not None: t.specify_memory        (job.memory)
     if job.disk           is not None: t.specify_disk          (job.disk)
 
-    for f in job.files:       t.specify_file(**f._asdict())
-    for d in job.directories: t.specify_directory(**d._asdict())
-    for b in job.buffers:     t.specify_buffer(**b._asdict())
+    for f in job.files:       t.specify_file(**f)
+    for d in job.directories: t.specify_directory(**d)
+    for b in job.buffers:     t.specify_buffer(**b)
 
     self.wq.submit(t)
-
     self.dag.update_state(job_id, "queued")
 
 
@@ -364,25 +379,26 @@ def get_state(argv):
   p = argparse.ArgumentParser(description="Print out the state of the job identified either by JOB_ID or STATE.")
   p.add_argument("--db", required=True)
   p.add_argument("--state", choices=("waiting", "queued", "finished", "failed"))
-  p.add_argument("--job_id")
-  p.add_argument("--fields", default="job_id,state,timestamp")
+  p.add_argument("--tag")
+  p.add_argument("--fields", default="tag,state,timestamp")
   p.add_argument("--sep", default="\t")
   args = p.parse_args(argv)
 
-  if args.state is not None and args.job_id is not None:
+  if args.state is not None and args.tag is not None:
     p.print_usage(file=sys.stderr)
-    print("{}: error: --state and --job_id are mutually exclusive".format(sys.argv[0]), file=sys.stderr)
+    print("{}: error: --state and --tag are mutually exclusive".format(sys.argv[0]), file=sys.stderr)
     sys.exit(1)
 
   dag = Dag(args.db)
   c = dag.conn.cursor()
-  
+
+  select = "select jobs.tag, states.* from jobs, states on jobs.job_id=states.job_id"
   if args.state is not None:
-    c.execute("select * from states where state=? and is_most_recent=1", (args.state,))
-  elif args.job_id is not None:
-    c.execute("select * from states where job_id=? and is_most_recent=1", (args.job_id,))
+    c.execute(select + " where states.is_most_recent=1 and states.state=?", (args.state,))
+  elif args.tag is not None:
+    c.execute(select + " where states.is_most_recent=1 and jobs.tag=?", (args.tag,))
   else:
-    c.execute("select * from states where is_most_recent=1")
+    c.execute(select + " where states.is_most_recent=1")
 
   fields = args.fields.split(",")
   for row in c:
@@ -391,11 +407,12 @@ def get_state(argv):
 def update_state(argv):
   p = argparse.ArgumentParser(description="Change state of the job identified by JOB_ID to STATE.")
   p.add_argument("--db", required=True)
-  p.add_argument("--job_id", required=True)
+  p.add_argument("--tag", required=True)
   p.add_argument("--state", choices=("waiting", "queued", "finished", "failed"), required=True)
   args = p.parse_args(argv)
   dag = Dag(args.db)
-  dag.update_state(args.job_id, args.state)
+  job_id = dag.tag_to_job_id(args.tag)
+  dag.update_state(job_id, args.state)
 
 
 if __name__ == "__main__":
