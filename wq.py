@@ -259,6 +259,11 @@ class Master:
   def __init__(self, db, wq):
     self.dag = Dag(db)
     self.wq = wq
+    self.old_status = None
+
+  def notify(self, msg):
+    now = datetime.datetime.now().isoformat(sep=" ")
+    print("{}: {}".format(now, msg))
 
   def run(self):
     # Loop forever; each iteration, ask the workqueue to give us some
@@ -267,28 +272,33 @@ class Master:
     while True:
       task = self.wq.wait(0)
       if task:
-        print("Finished {}".format(task.tag))
         job_id = self.postprocess_popped_task(task)
         self.queue_ready_children(job_id)
-      self.print_status()
+      else:
+        time.sleep(1)
       if self.dag.query_refresh():
         self.queue_ready_jobs()
-      time.sleep(1)
+      self.print_status()
 
   def print_status(self):
     dag_stats = self.dag.compute_dag_stats()
-    print("workers: init={}, ready={}, busy={}; tasks: running={}, waiting={}, complete={}; jobs: waiting={}, succeeded={}, failed={}".format(
+    new_status = "workers: init={}, ready={}, busy={}; tasks: running={}, waiting={}, complete={}; jobs: waiting={}, succeeded={}, failed={}".format(
       self.wq.stats.workers_init, self.wq.stats.workers_ready, self.wq.stats.workers_busy,
       self.wq.stats.tasks_running, self.wq.stats.tasks_waiting, self.wq.stats.tasks_complete,
-      dag_stats["waiting"], dag_stats["finished"], dag_stats["failed"]))
+      dag_stats["waiting"], dag_stats["finished"], dag_stats["failed"])
+    if self.old_status != new_status:
+      self.notify(new_status)
+      self.old_status = new_status
 
   def postprocess_popped_task(self, task):
     """Check whether the task succeeded, and update the database as appropriate.
     "Success" means that the task succeeded and its subprocess returned 0."""
     job_id = self.dag.tag_to_job_id(task.tag)
     if task.result == 0 and task.return_status == 0:
+      self.notify("Finished {}".format(task.tag))
       self.dag.update_state(job_id, "finished", task)
     else:
+      self.notify("Failed {}".format(task.tag))
       self.dag.update_state(job_id, "failed", task)
     return job_id
 
@@ -298,15 +308,15 @@ class Master:
       self.queue(job_id)
 
   def queue_ready_jobs(self):
-    print("Looking for ready jobs ...")
+    self.notify("Looking for ready jobs ...")
     job_ids = self.dag.find_ready_jobs()
-    print("... Found ready jobs: {}".format(job_ids))
+    self.notify("... Found ready jobs: {}".format(job_ids))
     for job_id in job_ids:
       self.queue(job_id)
 
   def queue(self, job_id):
     job = self.dag.get_job_info(job_id)
-    print("Queuing {}".format(job.tag))
+    self.notify("Queuing {}".format(job.tag))
 
     wq_py = os.path.abspath(__file__)
     t = work_queue.Task("{} _drive".format(wq_py))
