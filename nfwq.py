@@ -32,6 +32,30 @@ WAITFORTASK                = work_queue.WORK_QUEUE_WAITFORTASK
 #Buffer    = namedtuple("Buffer",    ("buffer",     "remote_name",         "flags"))
 Job       = namedtuple("Job",       ("job_id", "tag", "cmd", "algorithm", "preferred_host", "cores", "memory", "disk", "parents", "files", "directories", "buffers"))
 
+def input_file(local_name, remote_name=None, cache=True):
+  assert os.path.isfile(local_name)
+  if remote_name is None:
+    remote_name = os.path.basename(local_name)
+  flags = CACHE if cache else NOCACHE
+  return {
+    "local_name": local_name,
+    "remote_name": remote_name,
+    "type": INPUT,
+    "flags": flags
+  }
+
+def output_file(local_name, remote_name=None, cache=True):
+  assert os.path.isdir(os.path.dirname(os.path.abspath(local_name)))
+  if remote_name is None:
+    remote_name = os.path.basename(local_name)
+  flags = CACHE if cache else NOCACHE
+  return {
+    "local_name": local_name,
+    "remote_name": remote_name,
+    "type": OUTPUT,
+    "flags": flags
+  }
+
 def _fetch_exactly_one(cursor):
   res = cursor.fetchall()
   assert len(res) == 1
@@ -555,23 +579,27 @@ if __name__ == "__main__":
     if sys.argv[1] == "_drive":
       _drive()
 
-    if sys.argv[1] == "start_master":
+    elif sys.argv[1] == "start_master":
       start_master(sys.argv[2:])
 
-    if sys.argv[1] == "refresh_master":
+    elif sys.argv[1] == "refresh_master":
       refresh_master(sys.argv[2:])
 
-    if sys.argv[1] == "get_state":
+    elif sys.argv[1] == "get_state":
       get_state(sys.argv[2:])
 
-    if sys.argv[1] == "update_state":
+    elif sys.argv[1] == "update_state":
       update_state(sys.argv[2:])
 
-    if sys.argv[1] == "start_ssh_worker":
+    elif sys.argv[1] == "start_ssh_worker":
       start_ssh_worker(sys.argv[2:])
 
-    if sys.argv[1] == "start_condor_worker":
+    elif sys.argv[1] == "start_condor_worker":
       start_condor_worker(sys.argv[2:])
+
+    else:
+      print("nfwq: {} is not a valid command".format(sys.argv[1]))
+      sys.exit(1)
 
   else:
     print("usage: {} command args".format(sys.argv[0]))
