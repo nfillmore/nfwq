@@ -73,7 +73,7 @@ class Dag:
       # This table describes the job itself.
       self.conn.execute("""create table jobs (
         job_id          integer primary key autoincrement,
-        tag             text,
+        tag             text unique,
         cmd             text,
         algorithm       integer,
         preferred_host  text,
