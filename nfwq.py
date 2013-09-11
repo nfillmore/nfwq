@@ -481,20 +481,38 @@ def start_ssh_worker(argv):
   print(cmd)
   p = subprocess.Popen(["ssh", args.client, cmd])
 
+def _add_biostat_wisc_edu(host):
+  if host[-4:] != ".edu":
+    host += ".biostat.wisc.edu"
+  return host
+
 def start_condor_worker(argv):
 
   parser = argparse.ArgumentParser()
   parser.add_argument("--server", required=True)
   parser.add_argument("--port", required=True)
-  parser.add_argument("--client", required=True)
+  parser.add_argument("--client")
+  parser.add_argument("--exclude_clients")
   parser.add_argument("--num_processes", type=int, default=1)
   parser.add_argument("--frac_mem", type=float, default=0.85)
-  parser.add_argument("--frac_cpu", type=float, default=1.00)
+  parser.add_argument("--frac_cpu", type=float)
+  parser.add_argument("--num_cpu", type=int)
   parser.add_argument("--timeout", default="900s")
   parser.add_argument("--bindir")
   parser.add_argument("--logdir", default="/tier2/deweylab/scratch/nathanae/wq_condor_logs")
   parser.add_argument("--internal_driver", action="store_true", help="For internal use only.")
   args = parser.parse_args(argv)
+
+  if args.frac_cpu is not None and args.num_cpu is not None:
+    print("--frac_cpu and --num_cpu are incompatible.")
+    sys.exit(1)
+
+  if args.frac_cpu is not None and args.client is None:
+    print("--frac_cpu requires --client to be specified.")
+    sys.exit(1)
+
+  if args.frac_cpu is None and args.num_cpu is None:
+    args.frac_cpu = 1.0
 
   if args.internal_driver:
 
@@ -502,14 +520,18 @@ def start_condor_worker(argv):
     tot_mem = int(ls.decode("utf-8").split("\n")[1].split()[1])
     max_mem = int(args.frac_mem * tot_mem)
 
-    ls = subprocess.check_output(["cat", "/proc/cpuinfo"])
-    tot_cpu = 0
-    for l in ls.decode("utf-8").split("\n"):
-      if len(l.strip()) > 0:
-        k, v = l.split(":")
-        if k.strip() == "processor":
-          tot_cpu += 1
-    max_cpu = int(args.frac_cpu * tot_cpu)
+    if args.frac_cpu is not None:
+      ls = subprocess.check_output(["cat", "/proc/cpuinfo"])
+      tot_cpu = 0
+      for l in ls.decode("utf-8").split("\n"):
+        if len(l.strip()) > 0:
+          k, v = l.split(":")
+          if k.strip() == "processor":
+            tot_cpu += 1
+      max_cpu = int(args.frac_cpu * tot_cpu)
+    else:
+      assert args.num_cpu is not None
+      max_cpu = args.num_cpu
 
     if args.bindir is None:
       args.bindir = os.path.dirname(subprocess.check_output(["which", "work_queue_worker"]).decode("utf-8").strip())
@@ -528,42 +550,58 @@ def start_condor_worker(argv):
 
     current_script = os.path.abspath(__file__)
 
-    if args.client[-4:] != ".edu":
-      args.client += ".biostat.wisc.edu"
-
-    l = subprocess.check_output(["condor_status", "-format", "%s,", "TotalCpus", args.client])
-    tot_cpu = int(l.decode("utf-8").split(",")[0])
-    max_cpu = int(args.frac_cpu * tot_cpu)
+    if args.frac_cpu is not None:
+      l = subprocess.check_output(["condor_status", "-format", "%s,", "TotalCpus", args.client])
+      tot_cpu = int(l.decode("utf-8").split(",")[0])
+      max_cpu = int(args.frac_cpu * tot_cpu)
+    else:
+      assert args.num_cpu is not None
+      max_cpu = args.num_cpu
 
     if args.num_processes == 0:
-      args.num_processes = max_cpu
+      l = subprocess.check_output(["condor_status", "-format", "%s,", "TotalCpus", args.client])
+      tot_cpu = int(l.decode("utf-8").split(",")[0])
+      args.num_processes = tot_cpu
 
-    # We set should_transfer_files = yes not because we want to use condor to
-    # transfer files (we don't), but because this forces condor to execute in the
-    # EXECUTE directory, which we do want. Cf.
-    # <http://comments.gmane.org/gmane.comp.distributed.condor.user/8396>. There
-    # doesn't seem to be a better way to achieve this.
+    if args.client is not None:
+      args.client = _add_biostat_wisc_edu(args.client)
+      print("Queuing {} processses, each with {} cpu, on host {}.".format(args.num_processes, max_cpu, args.client))
+      requirements = """
+        requirements = (TARGET.Machine == "{client}")
+        output = {logdir}/condor.{client}.$(Process).out
+        error = {logdir}/condor.{client}.$(Process).err
+      """.format(client=args.client, logdir=args.logdir)
+
+    else:
+      if args.exclude_clients is not None:
+        excluded = [_add_biostat_wisc_edu(x) for x in args.exclude_clients.split(",")]
+        exstr = "&&".join("TARGET.Machine != \"{}\"".format(x) for x in excluded)
+        excluded_requirement = "requirements = (" + exstr + ")"
+      else:
+        excluded_requirement = ""
+      print("Queuing {} processses, each with {} cpu.".format(args.num_processes, max_cpu, args.client))
+      requirements = """
+        {excluded_requirement}
+        request_cpus = {max_cpu}
+        output = {logdir}/condor.$(Process).out
+        error = {logdir}/condor.$(Process).err
+      """.format(excluded_requirement=excluded_requirement, max_cpu=max_cpu, logdir=args.logdir)
+
     submit = """
       universe = vanilla
       notification = never
       getenv = True
       should_transfer_files = no
-      #should_transfer_files = yes
-      #when_to_transfer_output = ON_EXIT_OR_EVICT
       log = {logdir}/condor.log
 
-      requirements = (TARGET.Machine == "{client}")
-      #request_cpus = {max_cpu}
+      {requirements}
 
       executable = {current_script}
       arguments = start_condor_worker {args} --internal_driver 
 
-      output = {logdir}/condor.{client}.$(Process).out
-      error = {logdir}/condor.{client}.$(Process).err
-
       queue {num_processes}
     """.format(
-      logdir=args.logdir, client=args.client, max_cpu=max_cpu, current_script=current_script, args=" ".join(argv), num_processes=args.num_processes)
+      logdir=args.logdir, requirements=requirements, current_script=current_script, args=" ".join(argv), num_processes=args.num_processes)
 
     print(submit)
 
