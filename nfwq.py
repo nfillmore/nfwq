@@ -414,7 +414,7 @@ def get_state(argv):
   p.add_argument("--db", required=True)
   p.add_argument("--state", choices=("waiting", "queued", "finished", "failed"))
   p.add_argument("--tag")
-  p.add_argument("--fields", default="tag,state,timestamp")
+  p.add_argument("--fields", default="tag,state,timestamp,task_cmd_execution_time,task_hostname")
   p.add_argument("--sep", default="\t")
   args = p.parse_args(argv)
 
