@@ -616,6 +616,40 @@ def start_condor_worker(argv):
     rc = p.wait()
     assert rc == 0
 
+def condor_q(argv):
+  def unquote(s):
+    if s[0] == '"':
+      assert s[-1] == '"'
+      s = s[1:-1]
+    return s
+  def job_status(code):
+    # https://htcondor-wiki.cs.wisc.edu/index.cgi/wiki?p=MagicNumbers
+    codes = {
+      "0": "U",
+      "1": "I",
+      "2": "R",
+      "3": "X",
+      "4": "C",
+      "5": "H",
+      "6": ">",
+      "7": "S"
+    }
+    return codes[code]
+  out = subprocess.check_output(["condor_q", "-long", "-attributes", "ClusterId,ProcId,JobStatus,RemoteHost,LastRemoteHost,Args"]).decode("utf-8")
+  recs = out.split("\n\n")
+  for i, rec in enumerate(recs):
+    if rec.strip() != "":
+      ls = rec.split("\n")
+      if i == 1:
+        assert re.search(r'^-- Submitter:', ls[0]) is not None
+        ls = ls[1:]
+      d = dict(l.split(" = ") for l in ls)
+      print("\t".join((
+        d["ClusterId"] + "." + d["ProcId"],
+        job_status(d["JobStatus"]),
+        unquote(d.get("RemoteHost", "-")),
+        #unquote(d.get("LastRemoteHost", "-")),
+        d.get("Args", "-"))))
 
 if __name__ == "__main__":
   if len(sys.argv) > 1:
@@ -641,6 +675,9 @@ if __name__ == "__main__":
     elif sys.argv[1] == "start_condor_worker":
       start_condor_worker(sys.argv[2:])
 
+    elif sys.argv[1] == "condor_q":
+      condor_q(sys.argv[2:])
+
     else:
       print("nfwq: {} is not a valid command".format(sys.argv[1]))
       sys.exit(1)
@@ -654,6 +691,7 @@ if __name__ == "__main__":
     print("  update_state")
     print("  start_ssh_worker")
     print("  start_condor_worker")
+    print("  condor_q")
     sys.exit(1)
 
 #dag = Dag("test_dag.db", False)
