@@ -33,6 +33,9 @@ WAITFORTASK                = work_queue.WORK_QUEUE_WAITFORTASK
 Job       = namedtuple("Job",       ("job_id", "tag", "cmd", "algorithm", "preferred_host", "cores", "memory", "disk", "parents", "files", "directories", "buffers"))
 
 def input_file(local_name, remote_name=None, cache=True):
+  if local_name[0] != "/":
+    d = os.getcwd()
+    local_name = d + "/" + local_name
   assert os.path.isfile(local_name)
   if remote_name is None:
     remote_name = os.path.basename(local_name)
@@ -45,6 +48,9 @@ def input_file(local_name, remote_name=None, cache=True):
   }
 
 def output_file(local_name, remote_name=None, cache=True):
+  if local_name[0] != "/":
+    d = os.getcwd()
+    local_name = d + "/" + local_name
   assert os.path.isdir(os.path.dirname(os.path.abspath(local_name)))
   if remote_name is None:
     remote_name = os.path.basename(local_name)
