@@ -36,7 +36,7 @@ def input_file(local_name, remote_name=None, cache=True):
   if local_name[0] != "/":
     d = os.getcwd()
     local_name = d + "/" + local_name
-  assert os.path.isfile(local_name)
+  assert os.path.isfile(local_name), "{} is not a file".format(local_name)
   if remote_name is None:
     remote_name = os.path.basename(local_name)
   flags = CACHE if cache else NOCACHE
@@ -652,6 +652,8 @@ def condor_q(argv):
         d.get("Args", "-"))))
 
 if __name__ == "__main__":
+
+  show_usage = False
   if len(sys.argv) > 1:
 
     if sys.argv[1] == "_drive":
@@ -680,9 +682,12 @@ if __name__ == "__main__":
 
     else:
       print("nfwq: {} is not a valid command".format(sys.argv[1]))
-      sys.exit(1)
+      show_usage = True
 
   else:
+    show_usage = True
+
+  if show_usage:
     print("usage: {} command args".format(sys.argv[0]))
     print("available commands:")
     print("  start_master")
