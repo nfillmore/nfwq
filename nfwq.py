@@ -36,7 +36,7 @@ def input_file(local_name, remote_name=None, cache=True):
   if local_name[0] != "/":
     d = os.getcwd()
     local_name = d + "/" + local_name
-  assert os.path.isfile(local_name), "{} is not a file".format(local_name)
+  #assert os.path.isfile(local_name), "{} is not a file".format(local_name)
   if remote_name is None:
     remote_name = os.path.basename(local_name)
   flags = CACHE if cache else NOCACHE
