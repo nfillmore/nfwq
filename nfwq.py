@@ -492,8 +492,7 @@ def _add_biostat_wisc_edu(host):
     host += ".biostat.wisc.edu"
   return host
 
-def start_condor_worker(argv):
-
+def _start_condor_workers_parser():
   parser = argparse.ArgumentParser()
   parser.add_argument("--server", required=True)
   parser.add_argument("--port", required=True)
@@ -507,6 +506,11 @@ def start_condor_worker(argv):
   parser.add_argument("--bindir")
   parser.add_argument("--logdir", default="/tier2/deweylab/scratch/nathanae/wq_condor_logs")
   parser.add_argument("--internal_driver", action="store_true", help="For internal use only.")
+  return parser
+
+def start_condor_worker(argv):
+
+  parser = _start_condor_workers_parser()
   args = parser.parse_args(argv)
 
   if args.frac_cpu is not None and args.num_cpu is not None:
@@ -635,7 +639,16 @@ def condor_q(argv):
       "7": "S"
     }
     return codes[code]
-  out = subprocess.check_output(["condor_q", "-long", "-attributes", "ClusterId,ProcId,JobStatus,RemoteHost,LastRemoteHost,Args"]).decode("utf-8")
+  def extract_args(d):
+    parser = _start_condor_workers_parser()
+    tmp = unquote(d.get("Args", "-")).split()
+    if len(tmp) > 0 and tmp[0] == "start_condor_worker":
+      argv = tmp[1:]
+    else:
+      argv = ["--server", "-", "--port", "-"]
+    args = parser.parse_args(argv)
+    return args
+  out = subprocess.check_output(["condor_q", "-long", "-attributes", "ClusterId,ProcId,JobStatus,JobPrio,RemoteHost,LastRemoteHost,Args"]).decode("utf-8")
   recs = out.split("\n\n")
   for i, rec in enumerate(recs):
     if rec.strip() != "":
@@ -644,12 +657,14 @@ def condor_q(argv):
         assert re.search(r'^-- Submitter:', ls[0]) is not None
         ls = ls[1:]
       d = dict(l.split(" = ") for l in ls)
+      args = extract_args(d)
       print("\t".join((
         d["ClusterId"] + "." + d["ProcId"],
         job_status(d["JobStatus"]),
-        unquote(d.get("RemoteHost", "-")),
-        #unquote(d.get("LastRemoteHost", "-")),
-        d.get("Args", "-"))))
+        d["JobPrio"],
+        str(args.num_cpu),
+        "{}:{}".format(args.server, args.port),
+        unquote(d.get("RemoteHost", "-")))))
 
 if __name__ == "__main__":
 
