@@ -454,6 +454,22 @@ def update_state(argv):
   job_id = dag.tag_to_job_id(args.tag)
   dag.update_state(job_id, args.state)
 
+def retry_failed(argv):
+  p = argparse.ArgumentParser(description="Change the state of all failed jobs to \"waiting\".")
+  p.add_argument("--db", required=True)
+  args = p.parse_args(argv)
+  dag = Dag(args.db)
+  # Figure out which jobs are in state "failed".
+  c = dag.conn.cursor()
+  c.execute("select job_id from states where state=\"failed\" and is_most_recent=1")
+  job_ids = [r["job_id"] for r in c]
+  # Update their state to "waiting".
+  with dag.conn as c:
+    ts = datetime.datetime.now()
+    c.executemany("update states set is_most_recent=0 where job_id=? and is_most_recent=1", [(job_id,) for job_id in job_ids])
+    c.executemany("insert into states (job_id, state, is_most_recent, timestamp) values (?, ?, ?, ?)",
+      [(job_id, "waiting", 1, ts) for job_id in job_ids])
+
 def start_ssh_worker(argv):
 
   parser = argparse.ArgumentParser()
@@ -686,6 +702,9 @@ if __name__ == "__main__":
     elif sys.argv[1] == "update_state":
       update_state(sys.argv[2:])
 
+    elif sys.argv[1] == "retry_failed":
+      retry_failed(sys.argv[2:])
+
     elif sys.argv[1] == "start_ssh_worker":
       start_ssh_worker(sys.argv[2:])
 
@@ -709,6 +728,7 @@ if __name__ == "__main__":
     print("  refresh_master")
     print("  get_state")
     print("  update_state")
+    print("  retry_failed")
     print("  start_ssh_worker")
     print("  start_condor_worker")
     print("  condor_q")
