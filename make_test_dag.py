@@ -1,21 +1,17 @@
-import sys, nfwq, work_queue
+import sys, nfwq, work_queue, argparse
 
-d = "/scratch/nathanae/test_dag"
+p = argparse.ArgumentParser()
+p.add_argument("--workdir", required=True)
+args = p.parse_args()
 
-dag = nfwq.Dag(d + "/test_dag.db")
+dag = nfwq.Dag(args.workdir + "/test_dag.db")
 dag.init()
 
 dag.add(tag="node1",
         cmd=["touch", "node1.output"],
-        files=[{"local_name": d + "/node1.output", 
-                "remote_name": "node1.output", 
-                "type": nfwq.OUTPUT,
-                "flags": nfwq.NOCACHE}])
+        files=[nfwq.output_file(args.workdir + "/node1.output")])
 
 dag.add(tag="node2",
         cmd=["ls", "-ltrh", "/ua/nathanae/"],
-        files=[{"local_name": d + "/node1.output",
-                "remote_name": "node1.output",
-                "type": nfwq.INPUT,
-                "flags": nfwq.NOCACHE}],
+        files=[nfwq.input_file(args.workdir + "/node1.output")],
         parents=["node1"])
