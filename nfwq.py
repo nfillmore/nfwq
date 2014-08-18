@@ -30,9 +30,34 @@ WAITFORTASK                = work_queue.WORK_QUEUE_WAITFORTASK
 #File      = namedtuple("File",      ("local_name", "remote_name", "type", "flags"))
 #Directory = namedtuple("Directory", ("local_name", "remote_name", "type", "flags", "recursive"))
 #Buffer    = namedtuple("Buffer",    ("buffer",     "remote_name",         "flags"))
-Job       = namedtuple("Job",       ("job_id", "tag", "cmd", "algorithm", "preferred_host", "cores", "memory", "disk", "parents", "files", "directories", "buffers"))
+Job       = namedtuple("Job",       ("job_id", "tag", "cmd", "algorithm", "preferred_host", "cores", "memory", "disk", "parents", "files", "dirs", "bufs"))
 
-def input_file(local_name, remote_name=None, cache=True):
+valid_fields = ("tag",
+                "state",
+                "timestamp",
+                "task_tag",
+                "task_command",
+                "task_algorithm",
+                "task_output",
+                "task_id",
+                "task_return_status",
+                "task_result",
+                "task_host",
+                "task_hostname",
+                "task_submit_time",
+                "task_finish_time",
+                "task_app_delay",
+                "task_send_input_start",
+                "task_send_input_finish",
+                "task_execute_cmd_start",
+                "task_execute_cmd_finish",
+                "task_receive_output_start",
+                "task_receive_output_finish",
+                "task_total_bytes_transferred",
+                "task_total_transfer_time",
+                "task_cmd_execution_time")
+
+def input_file(local_name, remote_name=None, cache=False):
   if local_name[0] != "/":
     d = os.getcwd()
     local_name = d + "/" + local_name
@@ -41,26 +66,90 @@ def input_file(local_name, remote_name=None, cache=True):
     remote_name = os.path.basename(local_name)
   flags = CACHE if cache else NOCACHE
   return {
+    "category": "file",
     "local_name": local_name,
     "remote_name": remote_name,
     "type": INPUT,
-    "flags": flags
+    "flags": flags,
+    "cache": cache
   }
 
-def output_file(local_name, remote_name=None, cache=True):
+def output_file(local_name, remote_name=None, cache=False):
   if local_name[0] != "/":
     d = os.getcwd()
     local_name = d + "/" + local_name
-  assert os.path.isdir(os.path.dirname(os.path.abspath(local_name)))
+  assert os.path.isdir(os.path.dirname(os.path.abspath(local_name))), \
+    "{} isn't a directory".format(os.path.dirname(os.path.abspath(local_name)))
   if remote_name is None:
     remote_name = os.path.basename(local_name)
   flags = CACHE if cache else NOCACHE
   return {
+    "category": "file",
     "local_name": local_name,
     "remote_name": remote_name,
     "type": OUTPUT,
-    "flags": flags
+    "flags": flags,
+    "cache": cache
   }
+
+def input_dir(local_name, remote_name=None, cache=False, recursive=True):
+  d = input_file(local_name, remote_name, cache)
+  d["category"] = "dir"
+  d["recursive"] = 1 if recursive else 0
+  return d
+
+def output_dir(local_name, remote_name=None, cache=False, recursive=True):
+  d = output_file(local_name, remote_name, cache)
+  d["category"] = "dir"
+  d["recursive"] = 1 if recursive else 0
+  return d
+
+def input_buf(buffer, remote_name, cache=False):
+  flags = CACHE if cache else NOCACHE
+  return {
+    "category": "buf",
+    "buffer": buffer,
+    "remote_name": remote_name,
+    "flags": flags,
+    "cache": cache
+  }
+
+# Functions for use by jobs.
+
+# How much memory (in kilobytes) has been allocated to this worker?
+def mem():
+  return int(os.environ["NFWQ_MEM"])
+
+# How many cpus have been allocated to this worker?
+def cpu():
+  return int(os.environ["NFWQ_CPU"])
+
+# Where is the scratch space for the worker?
+def scratch():
+  return os.environ["NFWQ_SCRATCH"]
+
+# What is the hostname of the server?
+def server():
+  return os.environ["NFWQ_SERVER"]
+
+def get_file(server_path, client_path, cache=False):
+  full_server_path = server_host() + ":" + server_scratch() + "/" + server_path
+  if cache:
+    cache_path = client_scratch() + "/nfwq_cache/" + server_path.replace("/", "___")
+    sp.check_call(["rsync", "-avz", full_server_path, cache_path])
+    sp.check_call(["ln", "-s", cache_path, client_path])
+  else:
+    sp.check_call(["rsync", "-avz", full_server_path, client_path])
+
+# Put a file back to the server, from the client. The client path is relative
+# to the current working directory of the worker, and the server path is
+# relative to the scratch directory of the 
+def put_file(client_path, server_path):
+  full_server_path = server_host() + ":" + server_scratch() + "/" + server_path
+  #sp.check_call(["rsync", "-avz", client_path, full_server_path])
+  sp.check_call(["scp", "-rp", client_path, full_server_path])
+
+# End of functions for use by jobs.
 
 def _fetch_exactly_one(cursor):
   res = cursor.fetchall()
@@ -75,77 +164,103 @@ class Dag:
 
   def init(self):
     with self.conn:
+      try:
 
-      # This table describes the job itself.
-      self.conn.execute("""create table jobs (
-        job_id          integer primary key autoincrement,
-        tag             text unique,
-        cmd             text,
-        algorithm       integer,
-        preferred_host  text,
-        cores           integer,
-        memory          integer,
-        disk            integer,
-        files           text,
-        directories     text,
-        buffers         text)
-        """)
-      self.conn.execute("create index jobs_id on jobs (job_id)")
+        # This table describes the job itself.
+        self.conn.execute("""create table jobs (
+          job_id          integer primary key autoincrement,
+          tag             text unique,
+          cmd             text,
+          algorithm       integer,
+          preferred_host  text,
+          cores           integer,
+          memory          integer,
+          disk            integer,
+          files           text,
+          dirs            text,
+          bufs            text)
+          """)
+        self.conn.execute("create index jobs_id on jobs (job_id)")
 
-      # This table describes the DAG.
-      self.conn.execute("create table parents (job_id integer, parent_id integer)")
-      self.conn.execute("create index parents_job_id    on parents (job_id)")
-      self.conn.execute("create index parents_parent_id on parents (parent_id)")
+        # This table describes the DAG.
+        self.conn.execute("create table parents (job_id integer, parent_id integer)")
+        self.conn.execute("create index parents_job_id    on parents (job_id)")
+        self.conn.execute("create index parents_parent_id on parents (parent_id)")
 
-      # This table describes the status changes of the job.
-      self.conn.execute("""create table states (
-        job_id                       integer,   -- These first four columns
-        state                        text,      -- relate to the state itself.
-        is_most_recent               integer,
-        timestamp                    timestamp,
-        task_tag                     text,      -- The remaining columns
-        task_command                 text,      -- describe the task which
-        task_algorithm               integer,   -- resulted in this
-        task_output                  text,      -- finished or failed state.
-        task_id                      integer,
-        task_return_status           integer,
-        task_result                  integer,
-        task_host                    text,
-        task_hostname                text,
-        task_submit_time             integer,
-        task_finish_time             integer,
-        task_app_delay               integer,
-        task_send_input_start        integer,
-        task_send_input_finish       integer,
-        task_execute_cmd_start       integer,
-        task_execute_cmd_finish      integer,
-        task_receive_output_start    integer,
-        task_receive_output_finish   integer,
-        task_total_bytes_transferred integer,
-        task_total_transfer_time     integer,
-        task_cmd_execution_time      integer)
-        """)
-      self.conn.execute("create index states_job_id on states (job_id, is_most_recent)")
-      self.conn.execute("create index states_state on states (state, is_most_recent)")
+        # This table describes the status changes of the job.
+        self.conn.execute("""create table states (
+          job_id                       integer,   -- These first four columns
+          state                        text,      -- relate to the state itself.
+          is_most_recent               integer,
+          timestamp                    timestamp,
+          task_tag                     text,      -- The remaining columns
+          task_command                 text,      -- describe the task which
+          task_algorithm               integer,   -- resulted in this
+          task_output                  text,      -- finished or failed state.
+          task_id                      integer,
+          task_return_status           integer,
+          task_result                  integer,
+          task_host                    text,
+          task_hostname                text,
+          task_submit_time             integer,
+          task_finish_time             integer,
+          task_app_delay               integer,
+          task_send_input_start        integer,
+          task_send_input_finish       integer,
+          task_execute_cmd_start       integer,
+          task_execute_cmd_finish      integer,
+          task_receive_output_start    integer,
+          task_receive_output_finish   integer,
+          task_total_bytes_transferred integer,
+          task_total_transfer_time     integer,
+          task_cmd_execution_time      integer)
+          """)
+        self.conn.execute("create index states_job_id on states (job_id, is_most_recent)")
+        self.conn.execute("create index states_state on states (state, is_most_recent)")
 
-      # This table controls the pipeline.
-      self.conn.execute("create table refresh (request_refresh integer)")
+        # This table controls the pipeline.
+        self.conn.execute("create table refresh (request_refresh integer)")
 
-  def add(self, cmd, tag, parents=None, algorithm=None, preferred_host=None, files=None, directories=None, buffers=None, cores=None, memory=None, disk=None):
+      except sqlite3.OperationalError as e:
+        err = "nfwq: Error initializing the DAG. Perhaps the DAG's SQLite " + \
+              "database already exists? If so, you'll want either to " + \
+              "delete it and start over, or to skip calling the Dag's init() " + \
+              "method."
+        print(err, file=sys.stderr)
+        raise
+
+  def add(self, cmd, tag, parents=None, algorithm=None, preferred_host=None, files=None, dirs=None, bufs=None, io=None, cores=None, memory=None, disk=None):
     print("Adding {}".format(tag))
     with self.conn:
 
-      # Add info about the job itself.
-      if files       is None: files       = []
-      if directories is None: directories = []
-      if buffers     is None: buffers     = []
-      files       = json.dumps(files)
-      directories = json.dumps(directories)
-      buffers     = json.dumps(buffers)
+      # XXX it would be better to just get rid of files, dirs, bufs here
+
+      # Add info about the job itself, part 1.
+      if files is None: files = []
+      if dirs  is None: dirs  = []
+      if bufs  is None: bufs  = []
+
+      # Convert io to files, dirs, and bufs.
+      if io is None: io = []
+      for rec in io:
+        if   rec["category"] == "file": files.append(rec)
+        elif rec["category"] == "dir":  dirs .append(rec)
+        elif rec["category"] == "buf":  bufs .append(rec)
+        else: raise ValueError("Invalid record category: " + str(rec["category"]))
+
+      # Remove info about the categories.
+      files = [{k: v for k, v in rec.items() if k != "category"} for rec in files]
+      dirs  = [{k: v for k, v in rec.items() if k != "category"} for rec in dirs]
+      bufs  = [{k: v for k, v in rec.items() if k != "category"} for rec in bufs]
+
+      # Add info about the job itself, part 2.
+      files = json.dumps(files)
+      dirs  = json.dumps(dirs)
+      bufs  = json.dumps(bufs)
       c = self.conn.execute("""
-        insert into jobs (tag, cmd, algorithm, preferred_host, cores, memory, disk, files, directories, buffers)
+        insert into jobs (tag, cmd, algorithm, preferred_host, cores, memory, disk, files, dirs, bufs)
         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (tag, json.dumps(cmd), algorithm, preferred_host, cores, memory, disk, files, directories, buffers))
+        """, (tag, json.dumps(cmd), algorithm, preferred_host, cores, memory, disk, files, dirs, bufs))
       job_id = c.lastrowid
 
       # Add info about the job's dependencies.
@@ -161,6 +276,13 @@ class Dag:
 
       # Init the state of the job to "waiting".
       c.execute("insert into states (job_id, state, is_most_recent, timestamp) values (?, \"waiting\", 1, ?)", (job_id, datetime.datetime.now()))
+
+  def contains(self, tag):
+    c = self.conn.cursor()
+    c.execute("select count(tag) as cnt from jobs where tag=?", (tag,))
+    cnt = _fetch_exactly_one(c)["cnt"]
+    assert cnt in (0, 1)
+    return cnt == 1
 
   def get_state(self, job_id):
     c = self.conn.cursor()
@@ -256,9 +378,9 @@ class Dag:
 
     c.execute("select * from jobs where job_id=?", (job_id,))
     info = dict(_fetch_exactly_one(c))
-    info["files"]       = json.loads(info["files"])
-    info["directories"] = json.loads(info["directories"])
-    info["buffers"]     = json.loads(info["buffers"])
+    info["files"] = json.loads(info["files"])
+    info["dirs"]  = json.loads(info["dirs"])
+    info["bufs"]  = json.loads(info["bufs"])
 
     c.execute("select parent_id from parents where job_id=?", (job_id,))
     info["parents"] = tuple(r["parent_id"] for r in c)
@@ -351,7 +473,7 @@ class Master:
     wq_py = os.path.abspath(__file__)
     t = work_queue.Task("{} _drive".format(wq_py))
     t.specify_tag(job.tag)
-    t.specify_buffer(buffer=job.cmd, remote_name="__cmd__", flags=NOCACHE)
+    t.specify_buffer(buffer=job.cmd, remote_name="__cmd__", flags=NOCACHE, cache=False)
 
     if job.algorithm      is not None: t.specify_algorithm     (job.algorithm)
     if job.preferred_host is not None: t.specify_preferred_host(job.preferred_host)
@@ -359,9 +481,9 @@ class Master:
     if job.memory         is not None: t.specify_memory        (job.memory)
     if job.disk           is not None: t.specify_disk          (job.disk)
 
-    for f in job.files:       t.specify_file(**f)
-    for d in job.directories: t.specify_directory(**d)
-    for b in job.buffers:     t.specify_buffer(**b)
+    for f in job.files: t.specify_file(**f)
+    for d in job.dirs:  t.specify_directory(**d)
+    for b in job.bufs:  t.specify_buffer(**b)
 
     self.wq.submit(t)
     self.dag.update_state(job_id, "queued")
@@ -403,6 +525,8 @@ def start_master(argv):
   wq = work_queue.WorkQueue(port=args.port, name=args.name, catalog=catalog, exclusive=exclusive) # , shutdown=shutdown)
   #wq.enable_monitoring(args.db + ".monitor")
   #wq.specify_log(args.db + ".log")
+  wq.specify_algorithm(SCHEDULE_FILES)
+  wq.specify_task_order(TASK_ORDER_FIFO)
 
   # Start the master
   m = Master(args.db, wq)
@@ -416,33 +540,105 @@ def refresh_master(argv):
   dag.request_refresh()
 
 def get_state(argv):
-  p = argparse.ArgumentParser(description="Print out the state of the job identified either by JOB_ID or STATE.")
-  p.add_argument("--db", required=True)
-  p.add_argument("--state", choices=("waiting", "queued", "finished", "failed"))
-  p.add_argument("--tag")
-  p.add_argument("--fields", default="tag,state,timestamp,task_cmd_execution_time,task_hostname")
-  p.add_argument("--sep", default="\t")
+  valid_states = ("waiting", "queued", "finished", "failed")
+  default_fields = ("tag", "state", "timestamp", "task_cmd_execution_time",
+                    "task_hostname")
+
+  p = argparse.ArgumentParser(description="Print out the state of the job or jobs "
+                                          "identified by --state, --tag, or "
+                                          "--like.")
+  p.add_argument("--db", required=True, help="The database containg the DAG.")
+  p.add_argument("--state", choices=valid_states, metavar="STATE",
+                 help=("Only match this state. Choices: "
+                       "{}.".format(" ".join(valid_states))))
+  p.add_argument("--tag", help="Only match this tag.")
+  p.add_argument("--fields", nargs="+", choices=valid_fields, metavar="FIELDS",
+                 default=default_fields,
+                 help="Which fields to output. Default: {}. Choices: "
+                      "{}.".format(" ".join(default_fields),
+                                   " ".join(valid_fields)))
+  p.add_argument("--sep", default="\t", help="Column separator for output.")
+  p.add_argument("--like", nargs="*", default=tuple(),
+                 metavar="FIELD PATTERN",
+                 help="The first argument specifies a field to search, and "
+                      "the second argument specifies text to search for "
+                      "(wildcard: '%%'). These can be repeated to search "
+                      "multiple fields, with 'and' semantics. Fields can be "
+                      "searched but not output.")
+  p.add_argument("--not_like", nargs="*", default=tuple(),
+                 metavar="FIELD PATTERN",
+                 help="The first argument specifies a field to search, and "
+                      "the second argument specifies text to search for "
+                      "(wildcard: '%%'). These can be repeated to search "
+                      "multiple fields, with 'and' semantics. Fields can be "
+                      "searched but not output.")
   args = p.parse_args(argv)
 
+  # Check for invalid combination of --state and --tag.
   if args.state is not None and args.tag is not None:
-    p.print_usage(file=sys.stderr)
-    print("{}: error: --state and --tag are mutually exclusive".format(sys.argv[0]), file=sys.stderr)
+    print("{}: error: --state and --tag are mutually "
+          "exclusive".format(sys.argv[0]), file=sys.stderr)
     sys.exit(1)
 
+  # Check for valid number of arguments to --like.
+  if len(args.like) % 2 != 0:
+    print(("{}: error: --like requires an even number of arguments, but "
+           "we got {} arguments: {}").format(sys.argv[0], len(args.like),
+                                             args.like),
+          file=sys.stderr)
+    sys.exit(1)
+
+  # Check for valid number of arguments to --not_like.
+  if len(args.not_like) % 2 != 0:
+    print(("{}: error: --not_like requires an even number of arguments, but "
+           "we got {} arguments: {}").format(sys.argv[0], len(args.not_like),
+                                             args.not_like),
+          file=sys.stderr)
+    sys.exit(1)
+
+  # Setup core select statement.
   dag = Dag(args.db)
   c = dag.conn.cursor()
+  select = "select jobs.tag, states.* from jobs, states on " \
+           "jobs.job_id=states.job_id"
+  subs = []
 
-  select = "select jobs.tag, states.* from jobs, states on jobs.job_id=states.job_id"
+  # Add state/tag constraints.
   if args.state is not None:
-    c.execute(select + " where states.is_most_recent=1 and states.state=?", (args.state,))
+    select += " where states.is_most_recent=1 and states.state=?"
+    subs.append(args.state)
   elif args.tag is not None:
-    c.execute(select + " where states.is_most_recent=1 and jobs.tag=?", (args.tag,))
+    select += " where states.is_most_recent=1 and jobs.tag=?"
+    subs.append(args.tag)
   else:
-    c.execute(select + " where states.is_most_recent=1")
+    select += " where states.is_most_recent=1"
 
-  fields = args.fields.split(",")
+  # Add "like" constraints.
+  while len(args.like) > 0:
+    field = args.like.pop(0)
+    pattern = args.like.pop(0)
+    if field not in valid_fields:
+      print("{}: error: invalid field: {}".format(sys.argv[0], field))
+      sys.exit(1)
+    select += " and {} like ?".format(field)
+    subs.append(pattern)
+
+  # Add "not like" constraints.
+  while len(args.not_like) > 0:
+    field = args.not_like.pop(0)
+    pattern = args.not_like.pop(0)
+    if field not in valid_fields:
+      print("{}: error: invalid field: {}".format(sys.argv[0], field))
+      sys.exit(1)
+    select += " and {} not like ?".format(field)
+    subs.append(pattern)
+
+  # Actually execute the select statement.
+  c.execute(select, subs)
+
+  # Output the relevant fields.
   for row in c:
-    print(args.sep.join(str(row[f]) for f in fields))
+    print(args.sep.join(str(row[f]) for f in args.fields))
 
 def update_state(argv):
   p = argparse.ArgumentParser(description="Change state of the job identified by JOB_ID to STATE.")
@@ -498,7 +694,7 @@ def start_ssh_worker(argv):
   if args.bindir is None:
     args.bindir = os.path.dirname(subprocess.check_output(["which", "work_queue_worker"]).decode("utf-8").strip())
 
-  cmd = "ulimit -v {max_mem} && OMP_NUM_THREADS={max_cpu} {bindir}/work_queue_worker -t 900000000 -s {scratch} {server} {port}".format(
+  cmd = "ulimit -S -v {max_mem} && OMP_NUM_THREADS={max_cpu} NFWQ_MEM={max_mem} NFWQ_CPU={max_cpu} NFWQ_SCRATCH={scratch} NFWQ_SERVER={server} {bindir}/work_queue_worker -t 900000000 -s {scratch} {server} {port}".format(
     max_mem=max_mem, max_cpu=max_cpu, bindir=args.bindir, server=args.server, port=args.port, scratch=args.scratch)
   print(cmd)
   p = subprocess.Popen(["ssh", args.client, cmd])
@@ -521,9 +717,22 @@ def _start_condor_workers_parser():
   #parser.add_argument("--timeout", default="900s")
   parser.add_argument("--timeout", default="60s")
   parser.add_argument("--bindir")
-  parser.add_argument("--logdir", default="/tier2/deweylab/scratch/nathanae/wq_condor_logs")
+  #parser.add_argument("--logdir", default="/tier2/deweylab/scratch/nathanae/wq_condor_logs")
+  parser.add_argument("--logdir", default="/ua/nathanae/wq_condor_logs")
   parser.add_argument("--internal_driver", action="store_true", help="For internal use only.")
   return parser
+
+# From William Annis's email on 2013-12-27. The purpose of this function is to
+# give the automounter a chance to catch up before we actually try to access
+# anything in the path.
+def poke_autofs(path):
+  path = os.path.normpath(path)
+  steps = path.split(os.sep)
+  steps[0] = '/' # replace empty string
+  drill = ""
+  for step in steps:
+    drill = os.path.join(drill, step)
+    os.path.isdir(drill)
 
 def start_condor_worker(argv):
 
@@ -542,6 +751,9 @@ def start_condor_worker(argv):
     args.frac_cpu = 1.0
 
   if args.internal_driver:
+
+    poke_autofs("/tier2/deweylab/nathanae")
+    poke_autofs("/tier2/deweylab/scratch/nathanae")
 
     ls = subprocess.check_output(["free", "-k"])
     tot_mem = int(ls.decode("utf-8").split("\n")[1].split()[1])
@@ -569,7 +781,7 @@ def start_condor_worker(argv):
     tmpdir = os.environ["TMPDIR"]
     print("tmpdir is {}".format(tmpdir))
 
-    cmd = "ulimit -v {max_mem} && OMP_NUM_THREADS={max_cpu} {bindir}/work_queue_worker -t {timeout} -s {tmpdir} {server} {port}".format(
+    cmd = "ulimit -v {max_mem} && OMP_NUM_THREADS={max_cpu} NFWQ_MEM={max_mem} NFWQ_CPU={max_cpu} NFWQ_SCRATCH={tmpdir} NFWQ_SERVER={server} {bindir}/work_queue_worker -t {timeout} -s {tmpdir} {server} {port}".format(
       max_mem=max_mem, max_cpu=max_cpu, bindir=args.bindir, timeout=args.timeout, tmpdir=tmpdir, server=args.server, port=args.port)
     subprocess.check_call(cmd, shell=True)
 
@@ -595,9 +807,10 @@ def start_condor_worker(argv):
       print("Queuing {} processses, each with {} cpu, on host {}.".format(args.num_processes, max_cpu, args.client))
       requirements = """
         requirements = (TARGET.Machine == "{client}")
+        request_cpus = {max_cpu}
         output = {logdir}/condor.{client}.$(Process).out
         error = {logdir}/condor.{client}.$(Process).err
-      """.format(client=args.client, logdir=args.logdir)
+      """.format(client=args.client, logdir=args.logdir, max_cpu=max_cpu)
 
     else:
       if args.exclude_clients is not None:
