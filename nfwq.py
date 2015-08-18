@@ -1,4 +1,3 @@
-#!/u/deweylab/sw/python-3.3.2/arch/x86_64-redhat-linux-gnu/bin/python3
 import json, time, os, sys, work_queue, subprocess, glob, argparse, re, sqlite3, datetime
 from collections import namedtuple
 
@@ -456,9 +455,9 @@ class Master:
       self.queue(job_id)
 
   def queue_ready_jobs(self):
-    self.notify("Looking for ready jobs ...")
+    self.notify("Looking for ready jobs.")
     job_ids = self.dag.find_ready_jobs()
-    self.notify("... Found ready jobs: {}".format(job_ids))
+    self.notify("Found {} ready jobs.".format(len(job_ids)))
     for job_id in job_ids:
       self.queue(job_id)
 
