@@ -47,8 +47,6 @@ valid_fields = ("tag",
                 "task_submit_time",
                 "task_finish_time",
                 "task_app_delay",
-                "task_send_input_start",
-                "task_send_input_finish",
                 "task_execute_cmd_start",
                 "task_execute_cmd_finish",
                 "task_receive_output_start",
@@ -205,8 +203,6 @@ class Dag:
           task_submit_time             integer,
           task_finish_time             integer,
           task_app_delay               integer,
-          task_send_input_start        integer,
-          task_send_input_finish       integer,
           task_execute_cmd_start       integer,
           task_execute_cmd_finish      integer,
           task_receive_output_start    integer,
@@ -295,7 +291,9 @@ class Dag:
       if task is None:
         c.execute("insert into states (job_id, state, is_most_recent, timestamp) values (?, ?, ?, ?)", (job_id, state, 1, datetime.datetime.now()))
       else:
-        c.execute("insert into states values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        print("type(task.output)", type(task.output)) # XXX wtf
+        coerced_output = str(task.output)[:1000000] # XXX huge and harmful hack, to get my workflow to run
+        c.execute("insert into states values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
            (job_id,
             state,
             1,
@@ -303,7 +301,7 @@ class Dag:
             task.tag,
             task.command,
             task.algorithm,
-            task.output,
+            coerced_output,
             task.id,
             task.return_status,
             task.result,
@@ -312,8 +310,6 @@ class Dag:
             task.submit_time,
             task.finish_time,
             task.app_delay,
-            task.send_input_start,
-            task.send_input_finish,
             task.execute_cmd_start,
             task.execute_cmd_finish,
             task.receive_output_start,
@@ -666,6 +662,38 @@ def retry_failed(argv):
     c.executemany("insert into states (job_id, state, is_most_recent, timestamp) values (?, ?, ?, ?)",
       [(job_id, "waiting", 1, ts) for job_id in job_ids])
 
+def retry_queued(argv):
+  p = argparse.ArgumentParser(description="Change the state of all queued jobs to \"waiting\".")
+  p.add_argument("--db", required=True)
+  args = p.parse_args(argv)
+  dag = Dag(args.db)
+  # Figure out which jobs are in state "queued".
+  c = dag.conn.cursor()
+  c.execute("select job_id from states where state=\"queued\" and is_most_recent=1")
+  job_ids = [r["job_id"] for r in c]
+  # Update their state to "waiting".
+  with dag.conn as c:
+    ts = datetime.datetime.now()
+    c.executemany("update states set is_most_recent=0 where job_id=? and is_most_recent=1", [(job_id,) for job_id in job_ids])
+    c.executemany("insert into states (job_id, state, is_most_recent, timestamp) values (?, ?, ?, ?)",
+      [(job_id, "waiting", 1, ts) for job_id in job_ids])
+
+def retry_finished(argv):
+  p = argparse.ArgumentParser(description="Change the state of all finished jobs to \"waiting\".")
+  p.add_argument("--db", required=True)
+  args = p.parse_args(argv)
+  dag = Dag(args.db)
+  # Figure out which jobs are in state "finished".
+  c = dag.conn.cursor()
+  c.execute("select job_id from states where state=\"finished\" and is_most_recent=1")
+  job_ids = [r["job_id"] for r in c]
+  # Update their state to "waiting".
+  with dag.conn as c:
+    ts = datetime.datetime.now()
+    c.executemany("update states set is_most_recent=0 where job_id=? and is_most_recent=1", [(job_id,) for job_id in job_ids])
+    c.executemany("insert into states (job_id, state, is_most_recent, timestamp) values (?, ?, ?, ?)",
+      [(job_id, "waiting", 1, ts) for job_id in job_ids])
+
 def start_ssh_worker(argv):
 
   parser = argparse.ArgumentParser()
@@ -700,6 +728,8 @@ def start_ssh_worker(argv):
   p = subprocess.Popen(["ssh", args.client, cmd])
 
 def _add_biostat_wisc_edu(host):
+  if host == "":
+    return ""
   if host[-4:] != ".edu":
     host += ".biostat.wisc.edu"
   return host
@@ -884,8 +914,8 @@ def condor_q(argv):
     if rec.strip() != "":
       ls = rec.split("\n")
       if i == 1:
-        assert re.search(r'^-- Submitter:', ls[0]) is not None
-        ls = ls[1:]
+        if re.search(r'^-- Submitter:', ls[0]) is not None:
+          ls = ls[1:]
       d = dict(l.split(" = ") for l in ls)
       args = extract_args(d)
       print("\t".join((
@@ -919,6 +949,12 @@ if __name__ == "__main__":
     elif sys.argv[1] == "retry_failed":
       retry_failed(sys.argv[2:])
 
+    elif sys.argv[1] == "retry_queued":
+      retry_queued(sys.argv[2:])
+
+    elif sys.argv[1] == "retry_finished":
+      retry_finished(sys.argv[2:])
+
     elif sys.argv[1] == "start_ssh_worker":
       start_ssh_worker(sys.argv[2:])
 
@@ -943,6 +979,8 @@ if __name__ == "__main__":
     print("  get_state")
     print("  update_state")
     print("  retry_failed")
+    print("  retry_queued")
+    print("  retry_finished")
     print("  start_ssh_worker")
     print("  start_condor_worker")
     print("  condor_q")
